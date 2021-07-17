@@ -10,6 +10,7 @@ import 'package:analysis_server/lsp_protocol/protocol_special.dart';
 import 'package:analysis_server/protocol/protocol_generated.dart';
 import 'package:analysis_server/src/domains/completion/available_suggestions.dart';
 import 'package:analysis_server/src/lsp/client_capabilities.dart';
+import 'package:analysis_server/src/lsp/client_configuration.dart';
 import 'package:analysis_server/src/lsp/handlers/handlers.dart';
 import 'package:analysis_server/src/lsp/lsp_analysis_server.dart';
 import 'package:analysis_server/src/lsp/mapping.dart';
@@ -22,14 +23,52 @@ import 'package:analysis_server/src/services/completion/yaml/analysis_options_ge
 import 'package:analysis_server/src/services/completion/yaml/fix_data_generator.dart';
 import 'package:analysis_server/src/services/completion/yaml/pubspec_generator.dart';
 import 'package:analysis_server/src/services/completion/yaml/yaml_completion_generator.dart';
+import 'package:analysis_server/src/services/pub/pub_package_service.dart';
 import 'package:analyzer/dart/analysis/results.dart';
+import 'package:analyzer/dart/analysis/session.dart';
 import 'package:analyzer/dart/ast/ast.dart' as ast;
+import 'package:analyzer/file_system/file_system.dart';
 import 'package:analyzer/source/line_info.dart';
+import 'package:analyzer/src/dartdoc/dartdoc_directive_info.dart';
 import 'package:analyzer/src/services/available_declarations.dart';
 import 'package:analyzer/src/util/file_paths.dart' as file_paths;
 import 'package:analyzer_plugin/protocol/protocol_common.dart';
 import 'package:analyzer_plugin/protocol/protocol_generated.dart' as plugin;
 import 'package:analyzer_plugin/src/utilities/completion/completion_target.dart';
+
+import '../constants.dart';
+
+class ServerLikeDataStore {
+  ServerLikeDataStore(
+      {required this.capabilities,
+      required this.clientConfiguration,
+      required this.resourceProvider,
+      required this.pubPackageService,
+      required this.declarationsTracker,
+      required this.session});
+
+  LspClientCapabilities capabilities;
+  LspClientConfiguration clientConfiguration;
+  ResourceProvider resourceProvider;
+  PubPackageService pubPackageService;
+  DeclarationsTracker declarationsTracker;
+  AnalysisSession session;
+
+  DartdocDirectiveInfo getDartdocDirectiveInfoFor(ResolvedUnitResult result) {
+    return declarationsTracker
+            .getContext(result.session.analysisContext)
+            ?.dartdocDirectiveInfo ??
+        DartdocDirectiveInfo();
+  }
+
+  Future<ErrorOr<ResolvedUnitResult>> requireResolvedUnit(String path) async {
+    final result = await session.getResolvedUnit(path) as ResolvedUnitResult;
+    if (result.state != ResultState.VALID) {
+      return error(ServerErrorCodes.InvalidFilePath, 'Invalid file path', path);
+    }
+    return success(result);
+  }
+}
 
 class CompletionHandler
     extends MessageHandler<CompletionParams, List<CompletionItem>>
@@ -80,6 +119,85 @@ class CompletionHandler
 
       if (fileExtension == '.dart' && !unit.isError) {
         serverResultsFuture = _getServerDartItems(
+          clientCapabilities,
+          includeSuggestionSets,
+          unit.result,
+          offset,
+          triggerCharacter,
+          token,
+        );
+      } else if (fileExtension == '.yaml') {
+        YamlCompletionGenerator? generator;
+        if (file_paths.isAnalysisOptionsYaml(pathContext, path.result)) {
+          generator = AnalysisOptionsGenerator(server.resourceProvider);
+        } else if (file_paths.isFixDataYaml(pathContext, path.result)) {
+          generator = FixDataGenerator(server.resourceProvider);
+        } else if (file_paths.isPubspecYaml(pathContext, path.result)) {
+          generator = PubspecGenerator(
+              server.resourceProvider, server.pubPackageService);
+        }
+        if (generator != null) {
+          serverResultsFuture = _getServerYamlItems(
+            generator,
+            clientCapabilities,
+            path.result,
+            lineInfo.result,
+            offset,
+            token,
+          );
+        }
+      }
+
+      serverResultsFuture ??= Future.value(success(const <CompletionItem>[]));
+
+      final pluginResultsFuture = _getPluginResults(
+          clientCapabilities, lineInfo.result, path.result, offset);
+
+      // Await both server + plugin results together to allow async/IO to
+      // overlap.
+      final serverAndPluginResults =
+          await Future.wait([serverResultsFuture, pluginResultsFuture]);
+      final serverResults = serverAndPluginResults[0];
+      final pluginResults = serverAndPluginResults[1];
+
+      if (serverResults.isError) return serverResults;
+      if (pluginResults.isError) return pluginResults;
+
+      return success(
+        serverResults.result.followedBy(pluginResults.result).toList(),
+      );
+    });
+  }
+
+  Future<ErrorOr<List<CompletionItem>>> handle2(ServerLikeDataStore store,
+      CompletionParams params, CancellationToken token) async {
+    final clientCapabilities = store.capabilities;
+
+    final includeSuggestionSets =
+        suggestFromUnimportedLibraries && clientCapabilities.applyEdit;
+
+    final triggerCharacter = params.context?.triggerCharacter;
+    final pos = params.position;
+    final path = pathOfDoc(params.textDocument);
+    final unit = await path.mapResult(store.requireResolvedUnit);
+
+    final lineInfo = await unit.map(
+      // If we don't have a unit, we can still try to obtain the line info for
+      // plugin contributors.
+      (error) => path.mapResult(getLineInfo),
+      (unit) => success(unit.lineInfo),
+    );
+    final offset =
+        await lineInfo.mapResult((lineInfo) => toOffset(lineInfo, pos));
+
+    return offset.mapResult((offset) async {
+      Future<ErrorOr<List<CompletionItem>>>? serverResultsFuture;
+      final pathContext = store.resourceProvider.pathContext;
+      final fileExtension = pathContext.extension(path.result);
+
+      if (fileExtension == '.dart' && !unit.isError) {
+        serverResultsFuture = _getServerDartItems2(
+          store,
           clientCapabilities,
           includeSuggestionSets,
           unit.result,
@@ -206,7 +324,7 @@ class CompletionHandler
     final performance = CompletionPerformance();
     performance.path = unit.path;
     performance.setContentsAndOffset(unit.content, offset);
-    server.performanceStats.completion.add(performance);
+    //server.performanceStats.completion.add(performance);
 
     return await performance.runRequestOperation((perf) async {
       final completionRequest =
@@ -392,6 +510,227 @@ class CompletionHandler
                       // https://github.com/microsoft/vscode-languageserver-node/issues/673
                       includeCommitCharacters:
                           server.clientConfiguration.previewCommitCharacters,
+                      completeFunctionCalls: completeFunctionCalls,
+                    ));
+            results.addAll(setResults);
+          });
+        }
+
+        // Perform fuzzy matching based on the identifier in front of the caret to
+        // reduce the size of the payload.
+        final fuzzyPattern = dartCompletionRequest.targetPrefix;
+        final fuzzyMatcher =
+            FuzzyMatcher(fuzzyPattern, matchStyle: MatchStyle.TEXT);
+
+        final matchingResults =
+            results.where((e) => fuzzyMatcher.score(e.label) > 0).toList();
+
+        performance.suggestionCount = results.length;
+
+        return success(matchingResults);
+      } on AbortCompletion {
+        return success([]);
+      }
+    });
+  }
+
+  Future<ErrorOr<List<CompletionItem>>> _getServerDartItems2(
+    ServerLikeDataStore store,
+    LspClientCapabilities capabilities,
+    bool includeSuggestionSets,
+    ResolvedUnitResult unit,
+    int offset,
+    String? triggerCharacter,
+    CancellationToken token,
+  ) async {
+    final performance = CompletionPerformance();
+    performance.path = unit.path;
+    performance.setContentsAndOffset(unit.content, offset);
+    //server.performanceStats.completion.add(performance);
+
+    return await performance.runRequestOperation((perf) async {
+      final completionRequest =
+          CompletionRequestImpl(unit, offset, performance);
+      final directiveInfo =
+          store.getDartdocDirectiveInfoFor(completionRequest.result);
+      final dartCompletionRequest = await DartCompletionRequestImpl.from(
+          perf, completionRequest, directiveInfo);
+      final target = dartCompletionRequest.target;
+
+      if (triggerCharacter != null) {
+        if (!_triggerCharacterValid(offset, triggerCharacter, target)) {
+          return success([]);
+        }
+      }
+
+      Set<ElementKind>? includedElementKinds;
+      Set<String>? includedElementNames;
+      List<IncludedSuggestionRelevanceTag>? includedSuggestionRelevanceTags;
+      if (includeSuggestionSets) {
+        includedElementKinds = <ElementKind>{};
+        includedElementNames = <String>{};
+        includedSuggestionRelevanceTags = <IncludedSuggestionRelevanceTag>[];
+      }
+
+      try {
+        var contributor = DartCompletionManager(
+          dartdocDirectiveInfo: directiveInfo,
+          includedElementKinds: includedElementKinds,
+          includedElementNames: includedElementNames,
+          includedSuggestionRelevanceTags: includedSuggestionRelevanceTags,
+        );
+
+        final serverSuggestions = await contributor.computeSuggestions(
+          perf,
+          completionRequest,
+          completionPreference: CompletionPreference.replace,
+        );
+
+        final insertLength = _computeInsertLength(
+          offset,
+          completionRequest.replacementOffset,
+          completionRequest.replacementLength,
+        );
+
+        if (token.isCancellationRequested) {
+          return cancelled();
+        }
+
+        /// completeFunctionCalls should be suppressed if the target is an
+        /// invocation that already has an argument list, otherwise we would
+        /// insert dupes.
+        final completeFunctionCalls = _hasExistingArgList(target.entity)
+            ? false
+            : store.clientConfiguration.completeFunctionCalls;
+
+        final results = serverSuggestions.map(
+          (item) {
+            var itemReplacementOffset =
+                item.replacementOffset ?? completionRequest.replacementOffset;
+            var itemReplacementLength =
+                item.replacementLength ?? completionRequest.replacementLength;
+            var itemInsertLength = insertLength;
+
+            // Recompute the insert length if it may be affected by the above.
+            if (item.replacementOffset != null ||
+                item.replacementLength != null) {
+              itemInsertLength = _computeInsertLength(
+                  offset, itemReplacementOffset, itemInsertLength);
+            }
+
+            return toCompletionItem(
+              capabilities,
+              unit.lineInfo,
+              item,
+              itemReplacementOffset,
+              itemInsertLength,
+              itemReplacementLength,
+              // TODO(dantup): Including commit characters in every completion
+              // increases the payload size. The LSP spec is ambigious
+              // about how this should be handled (and VS Code requires it) but
+              // this should be removed (or made conditional based on a capability)
+              // depending on how the spec is updated.
+              // https://github.com/microsoft/vscode-languageserver-node/issues/673
+              includeCommitCharacters:
+                  store.clientConfiguration.previewCommitCharacters,
+              completeFunctionCalls: completeFunctionCalls,
+            );
+          },
+        ).toList();
+
+        // Now compute items in suggestion sets.
+        var includedSuggestionSets = <IncludedSuggestionSet>[];
+        final declarationsTracker = store.declarationsTracker;
+        if (includedElementKinds != null &&
+            includedElementNames != null &&
+            includedSuggestionRelevanceTags != null) {
+          computeIncludedSetList(
+            declarationsTracker,
+            unit,
+            includedSuggestionSets,
+            includedElementNames,
+          );
+
+          // Build a fast lookup for imported symbols so that we can filter out
+          // duplicates.
+          final alreadyImportedSymbols = _buildLookupOfImportedSymbols(unit);
+
+          includedSuggestionSets.forEach((includedSet) {
+            final library = declarationsTracker.getLibrary(includedSet.id);
+            if (library == null) {
+              return;
+            }
+
+            // Make a fast lookup for tag relevance.
+            final tagBoosts = <String, int>{};
+            includedSuggestionRelevanceTags!
+                .forEach((t) => tagBoosts[t.tag] = t.relevanceBoost);
+
+            // Only specific types of child declarations should be included.
+            // This list matches what's in _protocolAvailableSuggestion in
+            // the DAS implementation.
+            bool shouldIncludeChild(Declaration child) =>
+                child.kind == DeclarationKind.CONSTRUCTOR ||
+                child.kind == DeclarationKind.ENUM_CONSTANT ||
+                (child.kind == DeclarationKind.GETTER && child.isStatic) ||
+                (child.kind == DeclarationKind.FIELD && child.isStatic);
+
+            // Collect declarations and their children.
+            final allDeclarations = library.declarations
+                .followedBy(library.declarations
+                    .expand((decl) => decl.children.where(shouldIncludeChild)))
+                .toList();
+
+            final setResults = allDeclarations
+                // Filter to only the kinds we should return.
+                .where((item) => includedElementKinds!
+                    .contains(protocolElementKind(item.kind)))
+                .where((item) {
+              // Check existing imports to ensure we don't already import
+              // this element (this exact element from its declaring
+              // library, not just something with the same name). If we do
+              // we'll want to skip it.
+              final declaringUri =
+                  item.parent?.locationLibraryUri ?? item.locationLibraryUri!;
+
+              // For enums and named constructors, only the parent enum/class is in
+              // the list of imported symbols so we use the parents name.
+              final nameKey = item.kind == DeclarationKind.ENUM_CONSTANT ||
+                      item.kind == DeclarationKind.CONSTRUCTOR
+                  ? item.parent!.name
+                  : item.name;
+              final key = _createImportedSymbolKey(nameKey, declaringUri);
+              final importingUris = alreadyImportedSymbols[key];
+
+              // Keep it only if:
+              // - no existing imports include it
+              //     (in which case all libraries will be offered as
+              //     auto-imports)
+              // - this is the first imported URI that includes it
+              //     (we don't want to repeat it for each imported library that
+              //     includes it)
+              return importingUris == null ||
+                  importingUris.first == '${library.uri}';
+            }).map((item) => declarationToCompletionItem(
+                      capabilities,
+                      unit.path,
+                      offset,
+                      includedSet,
+                      library,
+                      tagBoosts,
+                      unit.lineInfo,
+                      item,
+                      completionRequest.replacementOffset,
+                      insertLength,
+                      completionRequest.replacementLength,
+                      // TODO(dantup): Including commit characters in every completion
+                      // increases the payload size. The LSP spec is ambigious
+                      // about how this should be handled (and VS Code requires it) but
+                      // this should be removed (or made conditional based on a capability)
+                      // depending on how the spec is updated.
+                      // https://github.com/microsoft/vscode-languageserver-node/issues/673
+                      includeCommitCharacters:
+                          store.clientConfiguration.previewCommitCharacters,
                       completeFunctionCalls: completeFunctionCalls,
                     ));
             results.addAll(setResults);
